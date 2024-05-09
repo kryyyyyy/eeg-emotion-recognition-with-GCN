@@ -1,0 +1,311 @@
+import numpy as np
+import mne
+import scipy.io as scio
+import warnings
+import torch
+import torch.nn as nn
+from torch_geometric.data import DataLoader
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+import os
+from sklearn.model_selection import train_test_split
+import logging
+from scipy.signal import hilbert
+import scipy.sparse as sp
+import torch_geometric.nn as pyg_nn
+from sklearn.preprocessing import StandardScaler
+# 引入tensorboard记录loss和正确率
+from torch.utils.tensorboard import SummaryWriter
+ 
+ 
+# 设置日志级别为ERROR或CRITICAL
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+logging.getLogger('mne').setLevel(logging.ERROR)  # 或者 logging.CRITICAL
+ 
+# 超参数
+num_epochs = 1000            # 训练轮数
+num_sample = 60             # 时间轴上时间点数量,num_sample + t_max < 63(数据持续时间)
+learing_rate = 0.001        # 学习率
+t_max = 1                   # 每一个mne.epoch的持续长度
+output_types = 2           # LSTM输出种类数量
+ 
+ 
+def compute_phase_sync_matrix(eeg_data):
+    num_channels = 32
+    eeg_data = np.transpose(eeg_data)
+    phase_sync_matrix = np.zeros((num_channels, num_channels))
+ 
+    # 计算每个电极的相位
+    phase_data = np.angle(hilbert(eeg_data))
+ 
+    # 计算相位差的余弦值
+    for i in range(num_channels):
+        for j in range(i+1, num_channels):
+            phase_diff = np.abs(phase_data[:, i] - phase_data[:, j])
+            cos_phase_diff = np.cos(phase_diff)
+            phase_sync = np.mean(cos_phase_diff)
+            phase_sync_matrix[i, j] = phase_sync
+            phase_sync_matrix[j, i] = phase_sync
+    # 将结果转化为list
+    # phase_sync_matrix = phase_sync_matrix.tolist()
+    # 将矩阵中元素数值大于0的设置为1，小于0的设置为0
+    phase_sync_matrix[phase_sync_matrix > 0] = 1
+    phase_sync_matrix[phase_sync_matrix < 0] = 0
+    return phase_sync_matrix
+ 
+ 
+class Net(torch.nn.Module):
+    """构造GCN模型网络"""
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = GCNConv(60, 32)
+        self.conv2 = GCNConv(32, output_types)
+ 
+    def forward(self, data):    # 前向传播
+        x, edge_index, batch = data.x, data.edge_index, data.batch  # 赋值
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, training=self.training)
+ 
+        x = self.conv2(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, training=self.training)
+ 
+        x = pyg_nn.global_max_pool(x, batch)        # 池化降维出
+        return F.log_softmax(x, dim=1)  # softmax可以得到每张图片的概率分布，设置dim=1，可以看到每一行的加和为1，再取对数矩阵每个结果的值域变成负无穷到0
+ 
+ 
+def pre_train():
+    # 定义通道列表
+    num_channels = 32
+    channels = ['Fp1', 'AF3', 'F7', 'F3', 'FC1', 'FC5', 'T7', 'C3', 'CP1', 'CP5', 'P7', 'P3', 'Pz', 'PO3', 'O1', 'Oz',
+                'O2', 'PO4', 'P4', 'P8', 'CP6', 'CP2', 'C4', 'T8', 'FC6', 'FC2', 'F4', 'F8', 'AF4', 'Fp2', 'Fz', 'Cz']
+    # 这里初始空值维度设置为第一个文件第一个视频中的维度,便于拼接,之后需要去掉
+    features = np.empty((0, 60))  # 创建一个空的 features 数组
+    labels = []
+    graph_dataset = []
+    matrix_dataset = []
+    # 要遍历的文件夹路径
+    folder_path = "data/data_preprocessed_matlab"
+    # 遍历文件夹下的文件名
+    file_names = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+    # print(file_names)
+    test_file = ['s01.mat', 's02.mat', 's03.mat', 's04.mat', 's05.mat', 's06.mat', 's07.mat', 's08.mat', 's09.mat']
+    for i in test_file:
+        path = folder_path + "/" + i
+        input_features, y, per_matrix = dataset(path)
+        # 取得每个文件的特征和标签
+        features = np.vstack((features, input_features))
+        labels = np.append(labels, y)
+        # 将每个文件的相位同步矩阵存入matrix_dataset
+        for m in per_matrix:
+            # 重复添加5次
+            for n in range(5):
+                matrix_dataset.append(m)
+        # print(features.shape)
+        # print(labels.shape)
+    print("the shape of features is:", features.shape)
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
+    print("the shape of labels is:", labels.shape)
+    print("the shape of matrix_dataset is:", len(matrix_dataset))
+ 
+    # 构建可以输入图卷积神经网络中的相位同步矩阵，每32条数据(一个视频)构建一个矩阵（需修改）
+    no = 0
+    print(matrix_dataset)
+    # print("int(features.shape[0]/32):", int(features.shape[0]/32))
+    for i in range(int(features.shape[0]/32)):
+        graph_matrix = matrix_dataset[no]
+        edge_index_temp = sp.coo_matrix(graph_matrix)
+        indices = np.vstack((edge_index_temp.row, edge_index_temp.col))
+        edge_index = torch.LongTensor(indices)
+        x = torch.FloatTensor(features[32*i:32*(i+1), :])
+        y = torch.tensor(labels[i]).long()
+        data = Data(x=x, edge_index=edge_index, y=y)
+        graph_dataset.append(data)
+        no += 1
+ 
+    # 划分训练集和测试集
+    train_dataset, test_dataset = train_test_split(graph_dataset, test_size=0.2, random_state=42)
+    # 构建模型实例
+    model = Net()  # 构建模型实例
+    optimizer = torch.optim.Adam(model.parameters(), lr=learing_rate)           # 优化器，参数优化计算
+    train_loader = DataLoader(train_dataset, batch_size=40, shuffle=False)      # 加载训练数据集，训练数据中分成每批次40个图片data数据
+    test_loader = DataLoader(test_dataset, batch_size=40, shuffle=False)        # 读取测试数据集数据
+ 
+    # 定义测试函数
+    def evaluate(loader):   # 构造测试函数
+        # model.eval()        # 表示模型开始测试
+        with torch.no_grad():
+            for data in loader:             # 读取测试数据集单个data数据
+                pred = model(data).numpy()  # 将数据导入之前构造好的模型
+                label = data.y.numpy()      # 获取测试集的图片标签
+        # 将preds转化为数组形式
+        pred = np.array(pred)
+        label = np.array(label)
+        return pred, label
+    # 训练模型
+    for epoch in range(num_epochs):  # 训练所有训练数据集n次
+        loss_all = 0
+        # 一轮epoch优化的内容
+        for data in train_loader:
+            optimizer.zero_grad()   # 梯度清零
+            output = model(data)    # 前向传播，把一批训练数据集导入模型并返回输出结果
+            label = data.y          # 40张图片数据的标签集合
+            # print("label is", label)
+            # print("output is", output.shape)
+            loss = F.nll_loss(output, label)
+            loss.backward()             # 反向传播
+            loss_all += loss.item()     # 将最后的损失值汇总
+            optimizer.step()            # 更新模型参数
+        if epoch % 10 == 0:
+            print("epoch is", epoch)
+            print("loss is", loss.item())
+            # 输出测试集准确率
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for data in test_loader:
+                    labels = data.y
+                    outputs = model(data)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+            print('Accuracy of the network on the test images: %d %%' % (100 * correct / total))
+            writer.add_scalar('Train/Loss', loss, epoch)
+            writer.add_scalar('Test/Accuracy', 100 * correct / total, epoch)
+ 
+ 
+def eeg_power_band(epochs):
+    """
+    该函数根据epochs的特定频段中的相对功率来创建eeg特征
+    输入数据为被试观看一个视频中的raw
+    根据需求需要把该函数进行改动
+    psds_band之前的特征格式为(epoch数, 通道数)
+    新生成特征格式应当为(通道数, epoch数个某频段相对功率)
+    输入图卷积神经网络中的数据应当为(通道数, 特征)
+    与其相关的脑网络矩阵为(通道数, 通道数)
+    每一个视频数据对应一个label，故最后输入网络的数据应当为(通道数, 某频域相对功率特征)
+    因此下面部分的label区域(数量为视频数量)应当做出5(频域数量)的拓展
+    """
+    # 特定频带
+    FREQ_BANDS = {"delta": [0.5, 4.5],
+                  "theta": [4.5, 8.5],
+                  "alpha": [8.5, 11.5],
+                  "sigma": [11.5, 15.5],
+                  "beta": [15.5, 30]}
+    spectrum = epochs.compute_psd(method='welch', picks='eeg', fmin=0.5, fmax=30., n_fft=128, n_overlap=16)
+    psds, freqs = spectrum.get_data(return_freqs=True)
+    # 归一化 PSDs
+    psds /= np.sum(psds, axis=-1, keepdims=True)
+    X = []
+    for fmin, fmax in FREQ_BANDS.values():
+        psds_band = psds[:, :, (freqs >= fmin) & (freqs < fmax)].mean(axis=-1)
+        # print("psd_band.shape is ", psds_band.shape)
+        """
+        (60个epoch，(每一个epoch有32个通道，每一个通道的某个频段))
+        """
+        X.append([list(item) for item in zip(*psds_band)])
+        # print("X.shape is ", np.array(X).shape)
+    return X
+ 
+ 
+def label_trans(raw_label):
+    # 对值进行二进制编码（小于5.5为0， 大于为1）
+    # 该函数在调整分类类别的时候需要跟随目标类别进行调整
+    binary_arr = np.where(raw_label < 5.5, 0, 1)    # 小于 5.5 的值设置为 0，大于等于 5.5 的值设置为 1
+    decimal_arr = binary_arr.dot([1, 0, 0, 0])      # 将二进制数组转化为十进制数组
+    # print(decimal_arr)  # 输出生成的数组
+    repeated_arr = np.repeat(decimal_arr, 5)
+    return repeated_arr
+ 
+ 
+def dataset(file):
+    """
+    dataset key_word:
+    labels.shape    (40, 4)
+    解释：
+    labels用于标记被试看到每一个视频时的状态
+    第二维度中的四个数据代表四个评价标准arousal（唤醒度）, valence(愉悦度), dominance（支配度）, like（喜爱度）
+    data.shape      (40, 40, 8064)
+    解释：
+    第一个维度代表40段观看视频产生的脑电数据
+    第二个维度代表每段数据存在40个通道
+    第三个维度为采样点，长度在63s左右
+    根据官方网站得采样率为128hz
+    """
+    real_feature = []
+    original_data = scio.loadmat(file)
+    # print(original_data.keys())
+    sample_data = original_data['data']
+    sample_labels = original_data['labels']
+    sample_data = sample_data[:, :32, :]
+    # 计算每一个视频中的相位同步矩阵
+    per_matrix = []
+    for i in range(sample_data.shape[0]):
+        matrix = compute_phase_sync_matrix(sample_data[i])
+        per_matrix.append(matrix)
+    k = sample_data.shape[0]
+    # 每个人观看40个视频，每个视频有40个通道（取前32个EEG通道），每个通道有8064个采样点
+    # print("sample_data.shape is ", sample_data.shape)
+    # print("sample_labels.shape is ", sample_labels.shape)
+    # 根据官方文档设置通道
+    channel_names = ['Fp1', 'AF3', 'F7', 'F3', 'FC1', 'FC5', 'T7', 'C3',
+                    'CP1', 'CP5', 'P7', 'P3', 'Pz', 'PO3', 'O1', 'Oz',
+                    'O2', 'PO4', 'P4', 'P8', 'CP6', 'CP2', 'C4', 'T8',
+                    'FC6', 'FC2', 'F4', 'F8', 'AF4', 'Fp2', 'Fz', 'Cz']
+    # 设置采样率
+    sfreq = 128
+    info = mne.create_info(channel_names, sfreq)
+ 
+    # 设置所有通道种类为eeg
+    channel_types = {}
+    for i in channel_names:
+        channel_types[i] = 'eeg'
+ 
+    # 将观看者看第i个视频的感受提取出来创建raw
+    for i in range(0, k):
+        slice_data = sample_data[i, :, :]
+        raw = mne.io.RawArray(slice_data, info)
+        raw.set_channel_types(channel_types)
+        """
+        查看EEG信号图
+        raw.plot(title="The "+str(i)+" raw", bgcolor='pink', color='steelblue', n_channels=10, duration=10)
+        plt.pause(0)
+        """
+        # 构建事件数组
+        events = np.zeros((num_sample, 3))
+        for i in range(num_sample):
+            events[i][0] = i*sfreq
+        # print(events)
+        events = events.astype(int)
+        # 每一个epoch长度为从事件开始的采样点到 t_max 秒后的采样点,这里就不设置基线了
+        epochs = mne.Epochs(raw=raw, events=events, tmin=0, tmax=t_max, preload=True, baseline=None)
+        # print(epochs)
+        features = eeg_power_band(epochs)
+        features = np.array(features)
+        # print("features.shape is ", features.shape)
+        real_feature.append(features)
+        # print("real_feature.shape is ", np.array(real_feature).shape)
+ 
+    # print("real_feature.shape is ", np.array(real_feature).shape)
+    # print("real_feature is ", real_feature)
+    real_feature = np.array(real_feature).reshape(-1, 60)
+    # print("new real_feature is ", real_feature)
+ 
+    y = label_trans(sample_labels)      # 重整labels
+    # print("y.shape is ", y.shape)
+    # print("y is ", y)
+    # 返回当前文件下的40个视频中的特征以及labels
+    return real_feature, y, per_matrix
+ 
+ 
+def main():
+    pre_train()
+ 
+ 
+if __name__ == '__main__':
+    writer = SummaryWriter('logs')
+    main()
+    writer.close()
